@@ -1,12 +1,43 @@
+import hmac
+import hashlib
+import base64
+import gzip
+import hashlib
+from io import BytesIO
 import json
+import random
+import re
+import shutil
+import secrets
+import string
+import subprocess
+import schedule
+import threading
 import time
-from flask import Flask, Request, make_response, jsonify, request
+from flask import Flask, Request, render_template, make_response, jsonify, request, redirect, abort, send_from_directory
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from flask_bcrypt import Bcrypt
 import os
 import argparse
 from urllib.parse import parse_qs
+from datetime import datetime, timedelta, timezone
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
+
+
+#check if flaskkey exists
+if not os.path.exists("flaskkey"):
+	print("Creating new Flask secret key")
+	#create a new key
+	with open("flaskkey", "w") as f:
+		f.write(''.join(random.choice(string.ascii_letters + string.digits) for i in range(50)))
+app.secret_key = open("flaskkey", "r").read()
+
+bcrypt = Bcrypt(app)
+
+login_manager = LoginManager(app)
+login_manager.login_view = '/'
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--port', type=int, default=5000)
@@ -21,6 +52,8 @@ class Base(DeclarativeBase):
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///cardwarskingdom.db"
 db = SQLAlchemy(model_class=Base)
 db.init_app(app)
+
+badcharaters = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ";", "%", "^", "&", "(", ")", "{", "}", "[", "]", ".", ",", "'", "`", "!", "$", "#", "@", "+", "="]
 
 maintenance = False
 
@@ -46,10 +79,536 @@ def PersistVersion():
 		"clickable": "yes",
 		"android_version": android_version,
 		"version": pc_version,
-		"android_url": "https://github.com/shishkabob27/CardWarsKingdom/releases",
-		"pc_url": "https://github.com/shishkabob27/CardWarsKingdom/releases",
+		"android_url": "",
+		"pc_url": "",
 	}
 	return json.dumps(data)
+
+class AdminActivity(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    time = db.Column(db.Integer, nullable=False, default=int(time.time()))
+    message = db.Column(db.String(8192), nullable=True)
+
+class Admin(UserMixin, db.Model):
+	username: Mapped[str] = mapped_column(db.String(80), primary_key=True, unique=True, nullable=False)
+	password: Mapped[str] = mapped_column(db.String(80), nullable=False)
+	rank: Mapped[int] = mapped_column(db.Integer, nullable=False)
+
+	def get_id(self):
+		return str(self.username)
+	
+@login_manager.user_loader
+def load_user(user_id):
+	return Admin.query.get(user_id)
+
+@app.route("/admin", methods=['GET', 'POST'])
+def AdminPage():
+
+    #create an admin account if one doesn't exist
+	if not Admin.query.first():
+		randompassword = ''.join(random.choices(string.ascii_letters + string.digits, k=24))
+		newAdmin = Admin(username="admin", password=bcrypt.generate_password_hash(randompassword).decode('utf-8'), rank=0)
+		db.session.add(newAdmin)
+		db.session.commit()
+		Log("server", "Created admin account")
+		print(f"Admin account created! Username: admin, Password: {randompassword}")
+
+	if request.method == 'GET':
+		if current_user.is_authenticated:
+			if not isAdmin(current_user):
+				return abort(404)
+			return redirect("/admin/home")
+		else:
+			return render_template('admin_login.html')
+	if request.method == 'POST':
+		username = request.form['username']
+		password = request.form['password']
+		username = re.sub(r'[^a-zA-Z0-9]', '', username)
+		db_user = Admin.query.filter_by(username=username).first()
+		if db_user is None:
+			return make_response("Invalid Username or Password!", 400)
+		if not bcrypt.check_password_hash(db_user.password, password):
+			return make_response("Invalid Password or Username!", 400)
+		login_user(db_user, remember=True)
+		return redirect("/admin")
+
+def isAdmin(user):
+	if not user.is_authenticated:
+		return False
+	db_user = Admin.query.filter_by(username=user.username).first()
+	return db_user is not None
+
+@login_required
+@app.route("/admin/home")
+def AdminHome():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	adminActivity = AdminActivity.query.order_by(AdminActivity.time).all()
+	#convert time
+	for log in adminActivity:
+		log.time = datetime.fromtimestamp(log.time, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+	#reverse list
+	adminActivity.reverse()
+
+	return render_template('admin_home.html', Activity=adminActivity)
+
+@login_required
+@app.route("/admin/versions" , methods=['GET', 'POST'])
+def AdminVersions():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	if request.method == 'GET':
+
+		return render_template('admin_versions.html' , pc_version=open("data/persist/version.txt", "r").read(), android_version=open("data/persist/android_version.txt", "r").read())
+	elif request.method == 'POST':
+		form = request.form
+		form = {k: v[0] if len(v) == 1 else v for k, v in form.items()}
+
+		if "pc_version" not in form or form["pc_version"] == "":
+			return make_response("Invalid PC version!", 400)
+		if "android_version" not in form or form["android_version"] == "":
+			return make_response("Invalid Android version!", 400)
+
+		return redirect("/admin/versions")
+
+@login_required
+@app.route("/admin/server")
+def AdminServer():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	#create backup folder if it doesn't exist
+	if not os.path.exists("backup"):
+		os.makedirs("backup")
+
+	#get last backup in folder
+	last_backup_time = 0
+	last_backup_file = ""
+	for file in os.listdir("backup"):
+		if file.endswith(".zip"):
+			file_time = int(file.replace(".zip", "").replace("-", "").replace("_", ""))
+			if file_time > last_backup_time:
+				last_backup_time = file_time
+				last_backup_file = file.replace(".zip", "")
+
+	if last_backup_file == "":
+		last_backup = "Never"
+	else:
+		last_backup = time_ago_string(datetime.strptime(last_backup_file, "%Y-%m-%d_%H-%M-%S"))
+
+	return render_template('admin_server.html', last_backup=last_backup)
+
+def time_ago_string(date_time):
+    now = datetime.now()
+    time_difference = now - date_time
+
+    # Extracting hours and minutes
+    hours = time_difference.seconds // 3600
+    minutes = (time_difference.seconds // 60) % 60
+
+    if time_difference.days > 0:
+        return f"{time_difference.days} days ago"
+    elif hours > 0:
+        return f"{hours} {'hour' if hours == 1 else 'hours'} ago"
+    elif minutes > 0:
+        return f"{minutes} {'minute' if minutes == 1 else 'minutes'} ago"
+    else:
+        return f"{time_difference.seconds} seconds ago"
+
+@login_required
+@app.route("/admin/server/backup")
+def AdminBackup():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	backup = Backup()
+	if not backup:
+		return make_response("Failed to backup", 400)
+	return redirect("/admin/server")
+
+@login_required
+@app.route("/admin/server/pull")
+def AdminGitPull():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	Log("admin", current_user.username + " pulled from git.")
+
+	#Git pull and return response
+	output = subprocess.check_output(["git", "pull"])
+
+	Log("admin", "Pulled from git. Output: " + output.decode("utf-8"))
+
+	#TODO: restart server
+
+	return make_response(output.decode("utf-8"), 200)
+
+@login_required
+@app.route("/admin/createadmin", methods=['GET', 'POST'])
+def AdminCreateAdmin():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	if request.method == 'GET':
+		return render_template('admin_createadmin.html')
+	if request.method == 'POST':
+		username = request.form['username']
+		rank = request.form['rank']
+
+		#create random password
+		password = secrets.token_urlsafe(24)
+		new_admin = Admin(username=username, password=bcrypt.generate_password_hash(password).decode('utf-8'), rank=int(rank))
+		db.session.add(new_admin)
+		db.session.commit()
+
+		Log("admin", current_user.username + " created admin: " + username + " with rank: " + rank)
+		return "Admin created! Username: " + username + " Password: " + password
+
+@login_required
+@app.route("/admin/players")
+def AdminPlayers():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	players = Player.query.all()
+
+	#convert player to dict
+	players = [player.as_dict() for player in players]
+
+	#remove any players that do not have a multiplayer name
+	players = [player for player in players if player["game"] != None and player["leader_level"] != None]
+
+	#remove any player that is banned
+	players = [player for player in players if not IsUserBanned(player["username"])]
+
+	for player in players:
+		player["last_online"] = datetime.fromtimestamp(player["last_online"], tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+		#if player's multiplayer name is empty, attempt to get it from their game
+		if player["multiplayer_name"] == None:
+			player["multiplayer_name"] = GetNameFromSave(player["game"])
+
+	sortQuery = request.args.get('sort')
+
+	if sortQuery is not None:
+		players = sorted(players, key=lambda player: player[sortQuery], reverse=True)
+	else:
+		players = players[::-1]
+
+	return render_template('admin_players.html', players=players, player_count=len(players))
+
+def GetNameFromSave(save):
+
+	try:
+		game = DecryptGameData(save)
+	except Exception:
+		return None
+	if game is None:
+		return None
+	return game["MultiplayerPlayerName"]
+
+@login_required
+@app.route("/admin/players/<player>")
+def AdminPlayer(player):
+	if not isAdmin(current_user):
+		return abort(404)
+
+	player = Player.query.filter_by(username=player).first()
+
+	if player is None:
+		return make_response("No player found!", 404)
+
+	player = player.as_dict()
+
+	player["last_online"] = datetime.fromtimestamp(player["last_online"], tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+	game = None
+	try:
+		game = DecryptGameData(player["game"])
+		if player["multiplayer_name"] == None:
+			player["multiplayer_name"] = game["MultiplayerPlayerName"]
+	except Exception:
+		Log("admin", "Failed to decrypt player game data for player: " + player["username"])
+		game = None   
+
+	if game is None:
+		return render_template('admin_player.html', player=player) 
+
+	battle_history = game["BattleHistory"]
+	battle_history.sort(key=lambda x: x["recordTime"])
+
+	for battle in battle_history:
+		battle["recordTime"] = datetime.fromtimestamp(battle["recordTime"], tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+	#fix device name
+	if player["devicename"] is not None:
+		player["devicename"] = re.sub(r'%[0-9A-Fa-f]{2}', lambda m: chr(int(m.group(0)[1:], 16)), player["devicename"])
+
+	Inventory = game["Inventory"]
+
+	#remove all items that are not creatures
+	if Inventory is not None:
+		Inventory = [item for item in Inventory if item["_T"] == "CR"]
+
+	return render_template('admin_player.html', player=player, is_banned=IsUserBanned(player["username"]), SoftCurrency=game["SoftCurrency"], HardCurrency=int(game["PaidHardCurrency"]) + int(game["FreeHardCurrency"]), PvpCurrency=game["PvpCurrency"], InstalledDate=datetime.fromtimestamp(game["InstalledDate"], tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'), PVPBanned=bool(game["Zxcvbnm"]), MultiplayerLevel=game["MultiplayerLevel"], InventorySpace=game["InventorySpace"], BattleHistory=battle_history, DeviceName=player["devicename"], Inventory=Inventory)
+
+@login_required
+@app.route("/admin/players/<player>/game")
+def AdminPlayerGame(player):
+	if not isAdmin(current_user):
+		return abort(404)
+
+	player = Player.query.filter_by(username=player).first()
+
+	if player is None:
+		return make_response("No player found!", 404)
+
+	player = player.as_dict()
+
+	game = DecryptGameData(player["game"])
+
+	if game is None:
+		return make_response("No game found!", 404)
+
+	return jsonify(game)
+
+def DecryptGameData(game:str):
+	if game is None or game == b"" or game == b" ":
+		return None
+    #Decrypt
+	input_data = game
+	input_str = input_data.decode("utf-8")
+	index = input_str.find("&data=")
+	encoded_data = input_str[index + 6 :]
+	array = base64.b64decode(encoded_data)
+	try:
+		with gzip.GzipFile(fileobj=BytesIO(array), mode='rb') as gz:
+			decoded_data = gz.read().decode("utf-8")
+	except Exception:
+		Log("admin", "Failed to decrypt game data")
+		return None
+
+	#attempt to clean json
+	decoded_data = decoded_data.replace(',}', '}').replace(',],', '],').replace(',]', ']').replace(',,', ',')
+
+	return json.loads(decoded_data)
+
+@login_required
+@app.route("/admin/players/<player>/<action>")
+def AdminPlayerAction(player, action):
+	if not isAdmin(current_user):
+		return abort(404)
+
+	Log("admin", current_user.username + " performed " + action + " on " + player)
+
+	if action == "ban":
+		#check if player id is in banlist, if not, add it
+		if not IsUserBanned(player):
+			newban = Bans(username=player, bantype="userid", author=current_user.username, time=int(time.time()))
+			db.session.add(newban)
+			db.session.commit()
+	elif action == "unban":
+		#check if player id is in banlist, if yes, remove it
+		if IsUserBanned(player):
+			player_check = Bans.query.filter_by(username=player).first()
+			db.session.delete(player_check)
+			db.session.commit()
+	else:
+		return make_response("Invalid action!", 400)
+
+	return redirect("/admin/players/" + player)
+
+def SystemBan(username):
+	Log("admin", "SYSTEM BANNED " + username)
+	if not IsUserBanned(username):
+		newban = Bans(username=username, bantype="userid", author="SYSTEM", time=int(time.time()))
+		db.session.add(newban)
+		db.session.commit()
+
+@login_required
+@app.route("/admin/ipban/<ip>/unban")
+def AdminIPBan(ip):
+	if not isAdmin(current_user):
+		return abort(404)
+
+	Log("admin", current_user.username + " performed unban on " + ip)
+
+	player_check = Bans.query.filter_by(username=ip).first()
+	db.session.delete(player_check)
+	db.session.commit()
+
+	return redirect("/admin/bannedips")
+
+@login_required
+@app.route("/admin/ipban", methods=['POST'])
+def AdminIPBanAction():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	Log("admin", current_user.username + " performed ban on " + request.form['ip'])
+
+	newban = Bans(username=request.form['ip'], bantype="ip", author=current_user.username, time=int(time.time()))
+	db.session.add(newban)
+	db.session.commit()
+
+	return redirect("/admin/bannedips")
+
+
+@login_required
+@app.route("/admin/bannedplayers")
+def AdminBannedPlayers():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	bans = Bans.query.filter_by(bantype="userid").all()
+	bans = [ban.as_dict() for ban in bans]
+
+	#get player name
+	for ban in bans:
+		ban["multiplayer_name"] = Player.query.filter_by(username=ban["username"]).first().multiplayer_name
+		if ban["multiplayer_name"] is None:
+			ban["multiplayer_name"] = GetNameFromSave(Player.query.filter_by(username=ban["username"]).first().game)
+		if ban["time"] is not None:
+			ban["time"] = datetime.fromtimestamp(ban["time"], tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+	return render_template('admin_bannedplayers.html', bans=bans)
+
+@login_required
+@app.route("/admin/bannedips")
+def AdminBannedIPs():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	bans = Bans.query.filter_by(bantype="ip").all()
+	bans = [ban.as_dict() for ban in bans]
+
+	for ban in bans:
+		ban["time"] = datetime.fromtimestamp(ban["time"], tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+	return render_template('admin_bannedips.html', bans=bans)
+
+@login_required
+@app.route("/admin/maintenance")
+def AdminMaintenance():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	return render_template('admin_maintenance.html', maintenance=maintenance)
+
+@login_required
+@app.route("/admin/maintenance/<action>")
+def AdminMaintenanceAction(action):
+	if not isAdmin(current_user):
+		return abort(404)
+
+	global maintenance
+	if action == "enable":
+		maintenance = True
+	elif action == "disable":
+		maintenance = False
+	Log("admin", current_user.username + " updated maintenance mode to " + ("on" if maintenance else "off"))
+	return redirect("/admin/maintenance")
+
+@app.route("/admin/logout")
+def AdminLogout():
+	logout_user()
+	return redirect("/admin")
+
+def Backup():
+	#get date and time
+	now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+	os.makedirs("backup/" + now, exist_ok=True)
+
+	#copy database
+	shutil.copy("instance/cardwarskingdom.db", f"backup/{now}/cardwarskingdom.db")
+
+	#copy persist folder
+	shutil.copytree("data/persist", f"backup/{now}/persist")
+
+	#zip
+	shutil.make_archive("backup/" + now, 'zip', "backup/" + now)
+
+	#delete folder
+	shutil.rmtree("backup/" + now)
+
+	Log("admin", "Backed up")
+
+	return True
+
+@login_required
+@app.route("/admin/logs", methods=['GET'])
+def AdminLogs():
+	if not isAdmin(current_user):
+		return abort(404)    
+
+	perpage = 20
+	pagerequest = request.args.get('page', 1, type=int)
+	query = request.args.get('query', '', type=str)
+	logs = db.paginate(db.select(Logs).order_by(Logs.id.desc()), page=pagerequest, per_page=perpage)
+
+	if query != '':
+		logs = db.paginate(db.select(Logs).filter(Logs.player == query).order_by(Logs.id.desc()), page=pagerequest, per_page=perpage)
+
+	return render_template('admin_logs.html', logs=logs, query=query)
+
+@login_required
+@app.route("/admin/upsight", methods=['GET'])
+def AdminUpsight():
+	if not isAdmin(current_user):
+		return abort(404)
+
+	perpage = 20
+	pagerequest = request.args.get('page', 1, type=int)
+	query = request.args.get('query', '', type=str)
+	logs = db.paginate(db.select(UpsightLogs).order_by(UpsightLogs.id.desc()), page=pagerequest, per_page=perpage)
+
+	if query != '':
+		logs = db.paginate(db.select(UpsightLogs).filter(UpsightLogs.player_id == query).order_by(UpsightLogs.id.desc()), page=pagerequest, per_page=perpage)
+
+	#convert time
+	for log in logs.items:
+		log.time = datetime.fromtimestamp(log.time)
+
+	return render_template('admin_upsight.html', logs=logs, query=query)
+
+class Bans(db.Model):
+	username = db.Column(db.String(80), primary_key=True)
+	bantype = db.Column(db.String(80), nullable=False)
+	author = db.Column(db.String(80), nullable=True)
+	time = db.Column(db.Integer, nullable=True, default=int(time.time()))
+
+	def as_dict(self):
+		return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+class Logs(db.Model):
+	id = db.Column(db.Integer, primary_key=True)
+	date = db.Column(db.String(80), nullable=False)
+	time = db.Column(db.String(80), nullable=False)
+	player = db.Column(db.String(80), nullable=False)
+	ip = db.Column(db.String(80), nullable=True)
+	message = db.Column(db.String(8192), nullable=False)
+
+class UpsightLogs(db.Model):
+	id = db.Column(db.Integer, primary_key=True)
+	player_id = db.Column(db.String(80), nullable=False)
+	time = db.Column(db.Integer, nullable=False, default=int(time.time()))
+	event = db.Column(db.String(80), nullable=False)
+	action = db.Column(db.String(80), nullable=False)
+	message = db.Column(db.String(1024), nullable=True)
+
+def PlayerLog(ip:str,player:str, message:str):
+	db_log = Logs(date=datetime.now().strftime("%Y-%m-%d"), time=datetime.now().strftime("%H:%M:%S"), player=player, ip=ip, message=message)
+	db.session.add(db_log)
+	db.session.commit()
+
+def IPFromRequest(request:Request):
+	ip = request.remote_addr
+	if request.headers.getlist("X-Forwarded-For"):
+		ip = request.headers.getlist("X-Forwarded-For")[0]
+	return ip
+
 
 class Player(db.Model):
 	username = db.Column(db.String(80), primary_key=True, unique=True, nullable=False)
@@ -69,6 +628,7 @@ class Player(db.Model):
 	last_online = db.Column(db.Integer, nullable=True, default=int(time.time()))
 	helpcount = db.Column(db.Integer, nullable=True, default=0)
 	anonymoushelpcount = db.Column(db.Integer, nullable=True, default=0)
+	devicename = db.Column(db.String(128), nullable=True)
  
 	def as_dict(self):
 		return {c.name: getattr(self, c.name) for c in self.__table__.columns}
@@ -126,7 +686,8 @@ def AccountGCAuth():
 		db_user = Player(username=clientData["player_id"])
 		db.session.add(db_user)
 		db.session.commit()
-		isplayernew = True     
+		isplayernew = True
+		PlayerLog(ip=IPFromRequest(request), player=clientData["player_id"], message="Created new player")     
 
 	data = {
 		"data": {
@@ -139,7 +700,7 @@ def AccountGCAuth():
 @app.route("/persist/getcc/")
 def GetCountryCode():
 	data = {
-		"ip": "127.0.0.1",
+		"ip": request.headers.get("X-Forwarded-For", request.remote_addr),
 		"country_code": "US"
 	}
 	return jsonify(data)
@@ -163,6 +724,8 @@ def MultiplayerNewPlayer():
 	db_user.allyboxspace = clientData["allyboxspace"]
 	db_user.level = clientData["level"]
 	db.session.commit()
+
+
  
 	return jsonify({
 		"success": True,
@@ -534,3 +1097,6 @@ if __name__ == '__main__':
 
 with app.app_context():
 	db.create_all()
+
+scheduler_thread = threading.Thread(target=run_scheduler)
+scheduler_thread.start()
